@@ -17,3 +17,25 @@ body {
 .glass {
   @apply bg-white/5 backdrop-blur-xl border border-white/10 rounded-xl;
 }
+
+.glass-fire {
+  @apply bg-gradient-to-br from-orange-500/10 to-red-500/5 backdrop-blur-xl border border-orange-500/20 rounded-xl;
+}
+
+.sharp-badge {
+  @apply inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-bold bg-gradient-to-r from-orange-500 to-red-500 text-white shadow-lg shadow-orange-500/20;
+}
+
+.steam-badge {
+  @apply inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-bold bg-gradient-to-r from-yellow-500 to-orange-500 text-black;
+}
+
+.sport-nba { border-left: 3px solid #f97316; }
+.sport-nhl { border-left: 3px solid #3b82f6; }
+.sport-cbb { border-left: 3px solid #a855f7; }
+
+@keyframes fire-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.7; }
+}
+.animate-fire { animation: fire-pulse 2s ease-in-out infinite; }

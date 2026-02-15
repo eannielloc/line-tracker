@@ -10,33 +10,11 @@ const SPORT_KEYS: Record<string, string> = {
   cbb: 'basketball_ncaab',
 };
 
-interface OddsOutcome {
-  name: string;
-  price: number;
-  point?: number;
-}
+interface OddsOutcome { name: string; price: number; point?: number; }
+interface OddsMarket { key: string; outcomes: OddsOutcome[]; }
+interface OddsBookmaker { key: string; title: string; markets: OddsMarket[]; }
+interface OddsEvent { id: string; sport_key: string; home_team: string; away_team: string; commence_time: string; bookmakers: OddsBookmaker[]; }
 
-interface OddsMarket {
-  key: string;
-  outcomes: OddsOutcome[];
-}
-
-interface OddsBookmaker {
-  key: string;
-  title: string;
-  markets: OddsMarket[];
-}
-
-interface OddsEvent {
-  id: string;
-  sport_key: string;
-  home_team: string;
-  away_team: string;
-  commence_time: string;
-  bookmakers: OddsBookmaker[];
-}
-
-// Simple in-memory cache (5 min TTL)
 const cache: Record<string, { data: any; ts: number }> = {};
 const CACHE_TTL = 5 * 60 * 1000;
 
@@ -58,7 +36,6 @@ function parseGame(raw: OddsEvent, sport: string) {
   const homeML = h2h?.find(o => o.name === raw.home_team);
   const awayML = h2h?.find(o => o.name === raw.away_team);
 
-  // Estimate public money (favorites get 55-70%)
   let publicHomePct: number | null = null;
   let publicAwayPct: number | null = null;
   let publicOverPct: number | null = null;
@@ -98,17 +75,68 @@ function parseGame(raw: OddsEvent, sport: string) {
     public_under_pct: publicUnderPct,
     sharp_side: null,
     sharp_total: null,
+    steam_move: false,
+    rlm_side: false,
+    rlm_total: false,
     snapshot_time: new Date().toISOString(),
     snapshot_label: 'live',
   };
 }
 
+function enrichWithOpenLines(games: any[], openGames: any[]) {
+  if (!openGames.length) return games;
+  const openMap: Record<string, any> = {};
+  openGames.forEach(g => { openMap[g.id] = g; });
+
+  return games.map(g => {
+    const open = openMap[g.id];
+    if (!open) return g;
+
+    g.spread_home_open = open.spread_home;
+    g.total_open = open.total;
+    g.ml_home_open = open.ml_home;
+    g.ml_away_open = open.ml_away;
+
+    // Detect RLM on spread
+    if (open.spread_home != null && g.spread_home != null && g.public_home_pct != null) {
+      const spreadMoved = g.spread_home - open.spread_home;
+      if (g.public_home_pct > 55 && spreadMoved > 0) {
+        g.sharp_side = 'away';
+        g.rlm_side = true;
+      } else if (g.public_away_pct > 55 && spreadMoved < 0) {
+        g.sharp_side = 'home';
+        g.rlm_side = true;
+      }
+    }
+
+    // Detect RLM on total
+    if (open.total != null && g.total != null && g.public_over_pct != null) {
+      const totalMoved = g.total - open.total;
+      if (g.public_over_pct > 55 && totalMoved < 0) {
+        g.sharp_total = 'under';
+        g.rlm_total = true;
+      } else if (g.public_under_pct > 55 && totalMoved > 0) {
+        g.sharp_total = 'over';
+        g.rlm_total = true;
+      }
+    }
+
+    // Detect steam moves (1.5+ pts)
+    if (open.spread_home != null && g.spread_home != null) {
+      if (Math.abs(g.spread_home - open.spread_home) >= 1.5) g.steam_move = true;
+    }
+    if (open.total != null && g.total != null) {
+      if (Math.abs(g.total - open.total) >= 1.5) g.steam_move = true;
+    }
+
+    return g;
+  });
+}
+
 async function fetchLiveOdds(sport: string) {
   const cacheKey = `live_${sport}`;
   const cached = cache[cacheKey];
-  if (cached && Date.now() - cached.ts < CACHE_TTL) {
-    return cached.data;
-  }
+  if (cached && Date.now() - cached.ts < CACHE_TTL) return cached.data;
 
   const apiKey = SPORT_KEYS[sport];
   if (!apiKey || !ODDS_API_KEY) return [];
@@ -120,49 +148,82 @@ async function fetchLiveOdds(sport: string) {
   const data: OddsEvent[] = await res.json();
   const games = data.map(g => parseGame(g, sport));
 
-  cache[cacheKey] = { data: games, ts: Date.now() };
-  return games;
+  // Try to enrich with opening lines
+  const today = new Date().toISOString().slice(0, 10);
+  const openGames = loadEarliestSnapshot(today, sport);
+  const enriched = enrichWithOpenLines(games, openGames);
+
+  cache[cacheKey] = { data: enriched, ts: Date.now() };
+  return enriched;
+}
+
+function loadEarliestSnapshot(date: string, sport: string): any[] {
+  const dataDir = path.join(process.cwd(), 'data');
+  if (!fs.existsSync(dataDir)) return [];
+  const files = fs.readdirSync(dataDir)
+    .filter(f => f.startsWith(`${date}_${sport}`) && f.endsWith('.json'))
+    .sort();
+  if (files.length > 0) {
+    try { return JSON.parse(fs.readFileSync(path.join(dataDir, files[0]), 'utf-8')); } catch { return []; }
+  }
+  return [];
 }
 
 function loadSnapshot(date: string, sport: string, snapshot: string) {
   const dataDir = path.join(process.cwd(), 'data');
-  let filename = `${date}_${sport}`;
-  if (snapshot === '10pm') filename += '_10pm';
-  else if (snapshot === '12pm') filename += '_12pm';
-  else filename += '_latest';
+  const suffixes = snapshot === '10pm' ? ['_10pm'] : snapshot === '12pm' ? ['_12pm'] : ['_latest', '_afternoon'];
 
-  const filePath = path.join(dataDir, `${filename}.json`);
-  if (fs.existsSync(filePath)) {
-    return JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+  for (const suffix of suffixes) {
+    const filePath = path.join(dataDir, `${date}_${sport}${suffix}.json`);
+    if (fs.existsSync(filePath)) {
+      const games = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+      // Enrich with opening lines
+      const openGames = loadEarliestSnapshot(date, sport);
+      return enrichWithOpenLines(games, openGames);
+    }
   }
 
-  // Fallback: any snapshot for this date + sport
+  // Fallback: any file
   if (fs.existsSync(dataDir)) {
     const files = fs.readdirSync(dataDir)
       .filter(f => f.startsWith(`${date}_${sport}`) && f.endsWith('.json'))
-      .sort()
-      .reverse();
+      .sort().reverse();
     if (files.length > 0) {
-      return JSON.parse(fs.readFileSync(path.join(dataDir, files[0]), 'utf-8'));
+      const games = JSON.parse(fs.readFileSync(path.join(dataDir, files[0]), 'utf-8'));
+      const openGames = loadEarliestSnapshot(date, sport);
+      return enrichWithOpenLines(games, openGames);
     }
   }
   return [];
 }
 
 export async function GET(req: NextRequest) {
-  const sport = req.nextUrl.searchParams.get('sport') || 'nba';
+  const sport = req.nextUrl.searchParams.get('sport') || 'all';
   const date = req.nextUrl.searchParams.get('date') || new Date().toISOString().slice(0, 10);
   const snapshot = req.nextUrl.searchParams.get('snapshot') || 'latest';
-
-  let games;
-
-  // If requesting today + latest and we have API key, fetch live
   const today = new Date().toISOString().slice(0, 10);
-  if (date === today && snapshot === 'latest' && ODDS_API_KEY) {
-    games = await fetchLiveOdds(sport);
-  } else {
-    games = loadSnapshot(date, sport, snapshot);
+
+  let allGames: any[] = [];
+
+  const sports = sport === 'all' ? ['nba', 'nhl', 'cbb'] : [sport];
+
+  for (const s of sports) {
+    let games;
+    if (date === today && snapshot === 'latest' && ODDS_API_KEY) {
+      games = await fetchLiveOdds(s);
+    } else {
+      games = loadSnapshot(date, s, snapshot);
+    }
+    allGames.push(...(games || []));
   }
 
-  return NextResponse.json({ games, sport, date, snapshot });
+  // Add default fields for older data missing new fields
+  allGames = allGames.map(g => ({
+    steam_move: false,
+    rlm_side: false,
+    rlm_total: false,
+    ...g,
+  }));
+
+  return NextResponse.json({ games: allGames, sport, date, snapshot, updated: new Date().toISOString() });
 }
